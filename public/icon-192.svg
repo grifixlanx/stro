@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" width="192" height="192">
+  <rect width="192" height="192" rx="36" fill="#0c0306"/>
+  <circle cx="96" cy="96" r="80" stroke="#ef4444" stroke-width="6" fill="#180408" fill-opacity="0.9"/>
+  <circle cx="96" cy="96" r="56" stroke="#ef4444" stroke-width="3" stroke-dasharray="8 8" fill="none" opacity="0.6"/>
+  <circle cx="96" cy="96" r="32" stroke="#ef4444" stroke-width="2" fill="none" opacity="0.4"/>
+  <line x1="96" y1="16" x2="96" y2="176" stroke="#ef4444" stroke-width="2" opacity="0.5"/>
+  <line x1="16" y1="96" x2="176" y2="96" stroke="#ef4444" stroke-width="2" opacity="0.5"/>
+  <!-- Fish Sonar Blip -->
+  <path d="M72 86 C84 80, 116 80, 126 94 C116 108, 84 108, 72 102 L60 110 L64 94 L60 78 Z" fill="#22c55e" stroke="#86efac" stroke-width="2"/>
+  <circle cx="114" cy="92" r="3" fill="#ffffff"/>
+  <!-- Central Transducer -->
+  <circle cx="96" cy="96" r="8" fill="#ef4444"/>
+</svg>

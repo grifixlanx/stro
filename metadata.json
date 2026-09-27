@@ -1,0 +1,8 @@
+{
+  "name": "stro",
+  "description": "Tactical red sonar PC app for pinging friends to play games without disturbance. Features active radar display, stealth mode, and cross-PC alerts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
