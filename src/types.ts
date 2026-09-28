@@ -34,3 +34,4 @@ export interface UserProfile {
   soundEnabled: boolean;
   themeColor: ThemeColor;
 }
+export type CallKind = 'voice' | 'video';

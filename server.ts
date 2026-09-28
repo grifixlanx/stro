@@ -235,6 +235,43 @@ wss.on('connection', (ws: WebSocket) => {
           break;
         }
 
+        // Relay call signaling (invite/accept/decline/offer/answer/ICE/end)
+        case 'CALL_SIGNAL': {
+          const { toEmail, fromEmail, kind, callId, data } = payload;
+          if (!toEmail || !fromEmail || !kind) return;
+
+          const fromNorm = normalizeEmail(fromEmail);
+          const targetDevs = userSessions.get(normalizeEmail(toEmail));
+          let delivered = 0;
+
+          if (targetDevs) {
+            const out = JSON.stringify({
+              type: 'CALL_SIGNAL_RECEIVED',
+              payload: { fromEmail: fromNorm, kind, callId, data, timestamp: Date.now() }
+            });
+            for (const dev of targetDevs.values()) {
+              if (dev.ws.readyState === WebSocket.OPEN) {
+                dev.ws.send(out);
+                delivered++;
+              }
+            }
+          }
+
+          // Tell the caller right away if nobody could be reached
+          if (delivered === 0 && kind === 'invite') {
+            ws.send(JSON.stringify({
+              type: 'CALL_SIGNAL_RECEIVED',
+              payload: {
+                fromEmail: normalizeEmail(toEmail),
+                kind: 'unavailable',
+                callId,
+                timestamp: Date.now()
+              }
+            }));
+          }
+          break;
+        }
+
         // Heartbeat
         case 'HEARTBEAT': {
           if (registeredEmail && userSessions.has(registeredEmail)) {

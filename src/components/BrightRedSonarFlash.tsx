@@ -1,14 +1,15 @@
-import React, { useEffect, useState } from 'react';
-import { SonarSignalMessage } from '../types';
+import React, { useEffect, useRef, useState } from 'react';
+import { SonarSignalMessage, CallKind } from '../types';
 import { sonarAudio } from '../utils/audio';
 import { ThemeConfig } from '../utils/theme';
-import { Check, X } from 'lucide-react';
+import { Check, X, Phone, Video, Gamepad2 } from 'lucide-react';
 
 interface BrightRedSonarFlashProps {
   signal: SonarSignalMessage;
   theme: ThemeConfig;
   durationSeconds?: number;
   onRespond: (signalId: string, response: string) => void;
+  onCall?: (kind: CallKind, signal: SonarSignalMessage) => void;
   onDismiss: () => void;
 }
 
@@ -17,10 +18,16 @@ export const BrightRedSonarFlash: React.FC<BrightRedSonarFlashProps> = ({
   theme,
   durationSeconds = 12,
   onRespond,
+  onCall,
   onDismiss,
 }) => {
   const [timeLeft, setTimeLeft] = useState(durationSeconds);
   const [hasResponded, setHasResponded] = useState(false);
+  const [stage, setStage] = useState<'ask' | 'choose'>('ask');
+
+  // Keep the latest onDismiss without restarting timers on every render
+  const dismissRef = useRef(onDismiss);
+  dismissRef.current = onDismiss;
 
   // Play acoustic sound and vibrate
   useEffect(() => {
@@ -32,7 +39,7 @@ export const BrightRedSonarFlash: React.FC<BrightRedSonarFlashProps> = ({
     return () => clearTimeout(echoTimer);
   }, [signal.id]);
 
-  // Auto-dismiss countdown
+  // Stage 1: auto-dismiss countdown while waiting for YES / NO
   useEffect(() => {
     if (hasResponded) return;
 
@@ -40,7 +47,7 @@ export const BrightRedSonarFlash: React.FC<BrightRedSonarFlashProps> = ({
       setTimeLeft((prev) => {
         if (prev <= 0.2) {
           clearInterval(timer);
-          onDismiss();
+          dismissRef.current();
           return 0;
         }
         return Math.max(0, prev - 0.1);
@@ -48,29 +55,53 @@ export const BrightRedSonarFlash: React.FC<BrightRedSonarFlashProps> = ({
     }, 100);
 
     return () => clearInterval(timer);
-  }, [hasResponded, onDismiss]);
+  }, [hasResponded]);
 
-  const handleAction = (resp: 'accept' | 'decline') => {
+  // Stage 2: after YES, keep the options up for 30s, then close
+  useEffect(() => {
+    if (stage !== 'choose') return;
+    const t = setTimeout(() => dismissRef.current(), 30000);
+    return () => clearTimeout(t);
+  }, [stage]);
+
+  const handleYes = () => {
+    setHasResponded(true);
+    setStage('choose');
+    sonarAudio.playChirp();
+    onRespond(signal.id, 'accept');
+  };
+
+  const handleNo = () => {
     setHasResponded(true);
     sonarAudio.playChirp();
-    onRespond(signal.id, resp);
-    setTimeout(() => {
-      onDismiss();
-    }, 400);
+    onRespond(signal.id, 'decline');
+    setTimeout(() => dismissRef.current(), 400);
+  };
+
+  const handleReady = () => {
+    sonarAudio.playChirp();
+    onRespond(signal.id, 'ready');
+    setTimeout(() => dismissRef.current(), 300);
+  };
+
+  const handleCall = (kind: CallKind) => {
+    onCall?.(kind, signal);
+    dismissRef.current();
   };
 
   const senderName = signal.fromNickname || signal.fromEmail.split('@')[0];
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 backdrop-blur-md select-none overflow-hidden animate-pulse"
+      className={`fixed inset-0 z-50 flex items-center justify-center p-4 backdrop-blur-md select-none overflow-hidden ${
+        stage === 'ask' ? 'animate-pulse' : ''
+      }`}
       style={{
-        // Screen glows color according to user UI theme
         backgroundColor: `${theme.primary}33`,
         boxShadow: `inset 0 0 160px ${theme.primary}`,
       }}
     >
-      {/* Background full-screen radiating glow waves in UI theme color */}
+      {/* Background radiating glow waves */}
       <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
         <div
           className="w-[85vw] h-[85vw] max-w-[650px] max-h-[650px] rounded-full animate-ping opacity-30"
@@ -92,7 +123,7 @@ export const BrightRedSonarFlash: React.FC<BrightRedSonarFlashProps> = ({
       {/* CRT Scanline Overlay */}
       <div className="absolute inset-0 crt-scanlines opacity-25 pointer-events-none" />
 
-      {/* Small Box with ONLY green or red click buttons */}
+      {/* Response box */}
       <div
         className="relative z-10 w-full max-w-[320px] rounded-2xl p-5 text-center shadow-2xl border-2 space-y-4 animate-in fade-in zoom-in-95 duration-150"
         style={{
@@ -101,13 +132,13 @@ export const BrightRedSonarFlash: React.FC<BrightRedSonarFlashProps> = ({
           boxShadow: `0 0 60px ${theme.primaryGlow}`,
         }}
       >
-        {/* Minimal info */}
+        {/* Sender info */}
         <div>
           <div
             className="text-[10px] font-mono tracking-widest uppercase font-bold"
-            style={{ color: theme.primary }}
+            style={{ color: stage === 'ask' ? theme.primary : '#34d399' }}
           >
-            ● INCOMING SIGNAL
+            {stage === 'ask' ? '● INCOMING SIGNAL' : "✔ YOU'RE IN"}
           </div>
           <div className="font-tactical font-black text-xl text-white tracking-wide mt-1">
             {senderName}
@@ -117,41 +148,90 @@ export const BrightRedSonarFlash: React.FC<BrightRedSonarFlashProps> = ({
           </div>
         </div>
 
-        {/* Small Box: ONLY Green or Red buttons */}
-        <div className="grid grid-cols-2 gap-3 pt-1">
-          {/* GREEN BUTTON */}
-          <button
-            onClick={() => handleAction('accept')}
-            disabled={hasResponded}
-            className="py-3 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white font-tactical font-bold text-sm tracking-wider flex items-center justify-center gap-1.5 shadow-[0_0_20px_rgba(34,197,94,0.5)] transition-all"
-            title="Accept / Ready"
-          >
-            <Check className="w-5 h-5 stroke-[2.5]" />
-            <span>YES</span>
-          </button>
+        {stage === 'ask' ? (
+          <>
+            {/* YES / NO */}
+            <div className="grid grid-cols-2 gap-3 pt-1">
+              <button
+                onClick={handleYes}
+                disabled={hasResponded}
+                className="py-3 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white font-tactical font-bold text-sm tracking-wider flex items-center justify-center gap-1.5 shadow-[0_0_20px_rgba(34,197,94,0.5)] transition-all"
+                title="Accept"
+              >
+                <Check className="w-5 h-5 stroke-[2.5]" />
+                <span>YES</span>
+              </button>
 
-          {/* RED BUTTON */}
-          <button
-            onClick={() => handleAction('decline')}
-            disabled={hasResponded}
-            className="py-3 px-3 rounded-xl bg-red-600 hover:bg-red-500 active:scale-95 text-white font-tactical font-bold text-sm tracking-wider flex items-center justify-center gap-1.5 shadow-[0_0_20px_rgba(239,68,68,0.5)] transition-all"
-            title="Decline / Busy"
-          >
-            <X className="w-5 h-5 stroke-[2.5]" />
-            <span>NO</span>
-          </button>
-        </div>
+              <button
+                onClick={handleNo}
+                disabled={hasResponded}
+                className="py-3 px-3 rounded-xl bg-red-600 hover:bg-red-500 active:scale-95 text-white font-tactical font-bold text-sm tracking-wider flex items-center justify-center gap-1.5 shadow-[0_0_20px_rgba(239,68,68,0.5)] transition-all"
+                title="Decline / Busy"
+              >
+                <X className="w-5 h-5 stroke-[2.5]" />
+                <span>NO</span>
+              </button>
+            </div>
 
-        {/* Subtle countdown progress line */}
-        <div className="w-full bg-black/50 h-1.5 rounded-full overflow-hidden">
-          <div
-            className="h-full transition-all duration-100"
-            style={{
-              width: `${(timeLeft / durationSeconds) * 100}%`,
-              backgroundColor: theme.primary,
-            }}
-          />
-        </div>
+            {/* Countdown line */}
+            <div className="w-full bg-black/50 h-1.5 rounded-full overflow-hidden">
+              <div
+                className="h-full transition-all duration-100"
+                style={{
+                  width: `${(timeLeft / durationSeconds) * 100}%`,
+                  backgroundColor: theme.primary,
+                }}
+              />
+            </div>
+          </>
+        ) : (
+          <>
+            {/* Voice / Video */}
+            <div className="grid grid-cols-2 gap-3 pt-1">
+              <button
+                onClick={() => handleCall('voice')}
+                className="py-3 px-3 rounded-xl active:scale-95 text-white font-tactical font-bold text-sm tracking-wider flex items-center justify-center gap-1.5 border transition-all"
+                style={{
+                  backgroundColor: theme.buttonBg,
+                  borderColor: theme.primary,
+                  boxShadow: `0 0 15px ${theme.primaryGlow}`,
+                }}
+              >
+                <Phone className="w-4 h-4" />
+                <span>VOICE</span>
+              </button>
+
+              <button
+                onClick={() => handleCall('video')}
+                className="py-3 px-3 rounded-xl active:scale-95 text-white font-tactical font-bold text-sm tracking-wider flex items-center justify-center gap-1.5 border transition-all"
+                style={{
+                  backgroundColor: theme.buttonBg,
+                  borderColor: theme.primary,
+                  boxShadow: `0 0 15px ${theme.primaryGlow}`,
+                }}
+              >
+                <Video className="w-4 h-4" />
+                <span>VIDEO</span>
+              </button>
+            </div>
+
+            {/* Ready to play (bottom of the same box) */}
+            <button
+              onClick={handleReady}
+              className="w-full py-3 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 active:scale-95 text-white font-tactical font-bold text-sm tracking-wider flex items-center justify-center gap-2 shadow-[0_0_20px_rgba(34,197,94,0.5)] transition-all"
+            >
+              <Gamepad2 className="w-5 h-5" />
+              <span>READY TO PLAY</span>
+            </button>
+
+            <button
+              onClick={() => dismissRef.current()}
+              className="text-[11px] font-mono text-white/40 hover:text-white underline"
+            >
+              close
+            </button>
+          </>
+        )}
       </div>
     </div>
   );

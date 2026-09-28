@@ -1,14 +1,17 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { FriendContact, SonarSignalMessage, DeviceType, UserProfile, ThemeColor } from './types';
+import { FriendContact, SonarSignalMessage, DeviceType, UserProfile, ThemeColor, CallKind } from './types';
 import { FishFinderSonar } from './components/FishFinderSonar';
 import { FriendsTab } from './components/FriendsTab';
 import { BrightRedSonarFlash } from './components/BrightRedSonarFlash';
 import { SettingsModal } from './components/SettingsModal';
 import { LoginModal } from './components/LoginModal';
+import { CallScreen } from './components/CallScreen';
 import { THEMES } from './utils/theme';
 import { sonarAudio } from './utils/audio';
+import { useCall } from './utils/useCall';
 import { notificationController } from './utils/notifications';
 import { wakeLockManager } from './utils/wakeLock';
+
 import {
   Users,
   Radio,
@@ -25,8 +28,6 @@ function detectDevice(): DeviceType {
   const ua = navigator.userAgent;
   return /Mobi|Android|iPhone|iPad/i.test(ua) ? 'phone' : 'pc';
 }
-
-const AUTHORIZED_ADMIN_EMAIL = 'grifixlanx@gmail.com';
 
 export default function App() {
   const [userProfile, setUserProfile] = useState<UserProfile | null>(() => {
@@ -50,7 +51,6 @@ export default function App() {
   const [selectedFriendEmail, setSelectedFriendEmail] = useState<string | null>(null);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
-  // Removed mock example friends: starts empty!
   const [friends, setFriends] = useState<FriendContact[]>(() => {
     if (typeof window !== 'undefined') {
       const saved = localStorage.getItem('stro_friends_list');
@@ -104,7 +104,7 @@ export default function App() {
   // Active theme
   const currentTheme = THEMES[userProfile?.themeColor || 'red'];
 
-  // Realtime WebSocket & Connection
+  // Realtime state
   const [isConnected, setIsConnected] = useState(false);
   const [sonarWaveActive, setSonarWaveActive] = useState(false);
   const [activeSignal, setActiveSignal] = useState<SonarSignalMessage | null>(null);
@@ -112,55 +112,92 @@ export default function App() {
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<any>(null);
+  const pendingSignalsRef = useRef<{ msg: string; at: number }[]>([]);
+  const lastPongRef = useRef<number>(0);
+  const reconnectNowRef = useRef<() => void>(() => {});
+
+  // Latest values live in refs so the socket never reconnects
+  // just because friends/profile state changed.
+  const friendsRef = useRef<FriendContact[]>(friends);
+  friendsRef.current = friends;
+  const profileRef = useRef<UserProfile | null>(userProfile);
+  profileRef.current = userProfile;
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(null), 3500);
   };
 
+  // Voice / video calling
+  const call = useCall({
+    myEmail: userProfile?.email,
+    myName: userProfile?.nickname,
+    send: (msg) => {
+      const ws = wsRef.current;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(msg));
+        return true;
+      }
+      return false;
+    },
+    onNotice: showToast,
+  });
+  const callSignalRef = useRef(call.handleSignal);
+  callSignalRef.current = call.handleSignal;
+
   const syncWatchList = useCallback(() => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(
         JSON.stringify({
           type: 'WATCH_FRIENDS',
-          payload: {
-            friendEmails: friends.map((f) => f.email),
-          },
+          payload: { friendEmails: friendsRef.current.map((f) => f.email) },
         })
       );
     }
-  }, [friends]);
+  }, []);
 
-  const connectWebSocket = useCallback(() => {
-    if (!userProfile) return;
-    if (
-      wsRef.current &&
-      (wsRef.current.readyState === WebSocket.OPEN ||
-        wsRef.current.readyState === WebSocket.CONNECTING)
-    ) {
-      return;
-    }
+  useEffect(() => {
+    if (!userProfile?.email) return;
+    let stopped = false;
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}`;
+    const connect = () => {
+      const profile = profileRef.current;
+      if (stopped || !profile) return;
 
-    try {
+      // When running as a packaged app (Electron file:// or Capacitor localhost),
+      // window.location.host doesn't point at our real server, so always use the
+      // deployed Render URL in that case. The web version keeps auto-detecting.
+      const isPackagedApp =
+        window.location.protocol === 'file:' || window.location.hostname === 'localhost';
+      const wsUrl = isPackagedApp
+        ? 'wss://stro-kyo3.onrender.com'
+        : `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`;
+
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
+        if (wsRef.current !== ws) return;
         setIsConnected(true);
         ws.send(
           JSON.stringify({
             type: 'REGISTER_DEVICE',
             payload: {
-              email: userProfile.email,
-              nickname: userProfile.nickname,
-              deviceType: userProfile.deviceType,
+              email: profile.email,
+              nickname: profile.nickname,
+              deviceType: profile.deviceType,
             },
           })
         );
         syncWatchList();
+
+        // Send any signals that were waiting for the connection (ignore stale ones)
+        const queued = pendingSignalsRef.current;
+        pendingSignalsRef.current = [];
+        queued.forEach((q) => {
+          if (Date.now() - q.at < 30000) ws.send(q.msg);
+        });
       };
 
       ws.onmessage = (event) => {
@@ -168,8 +205,12 @@ export default function App() {
           const { type, payload } = JSON.parse(event.data);
 
           switch (type) {
+            case 'PONG': {
+              lastPongRef.current = Date.now();
+              break;
+            }
+
             case 'REGISTERED_OK': {
-              syncWatchList();
               break;
             }
 
@@ -239,8 +280,19 @@ export default function App() {
             }
 
             case 'SIGNAL_RESPONSE_RECEIVED': {
-              showToast(`✔ ${payload.fromEmail} responded: "${payload.response.toUpperCase()}"!`);
+              const label =
+                payload.response === 'accept'
+                  ? 'is IN ✅'
+                  : payload.response === 'ready'
+                  ? 'is READY TO PLAY 🎮'
+                  : 'is busy ❌';
+              showToast(`${payload.fromEmail} ${label}`);
               sonarAudio.playChirp();
+              break;
+            }
+
+            case 'CALL_SIGNAL_RECEIVED': {
+              callSignalRef.current(payload);
               break;
             }
           }
@@ -250,32 +302,66 @@ export default function App() {
       };
 
       ws.onclose = () => {
-        setIsConnected(false);
-        wsRef.current = null;
-        clearTimeout(reconnectTimerRef.current);
-        reconnectTimerRef.current = setTimeout(connectWebSocket, 2500);
+        if (wsRef.current === ws) {
+          wsRef.current = null;
+          setIsConnected(false);
+        }
+        if (!stopped) {
+          clearTimeout(reconnectTimerRef.current);
+          reconnectTimerRef.current = setTimeout(connect, 2500);
+        }
       };
 
       ws.onerror = () => {
         ws.close();
       };
-    } catch (e) {
-      console.warn('WS error:', e);
-    }
-  }, [userProfile, syncWatchList]);
-
-  useEffect(() => {
-    connectWebSocket();
-    return () => {
-      clearTimeout(reconnectTimerRef.current);
-      if (wsRef.current) wsRef.current.close();
     };
-  }, [userProfile?.email, userProfile?.deviceType, connectWebSocket]);
 
+    connect();
+
+    reconnectNowRef.current = () => {
+      const ws = wsRef.current;
+      if (!ws || ws.readyState === WebSocket.CLOSED) {
+        clearTimeout(reconnectTimerRef.current);
+        connect();
+      }
+    };
+
+    // When the app wakes up or the network returns, check the connection right away
+    const onWake = () => {
+      if (document.visibilityState === 'hidden') return;
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        reconnectNowRef.current();
+        return;
+      }
+      const sentAt = Date.now();
+      ws.send(JSON.stringify({ type: 'HEARTBEAT' }));
+      setTimeout(() => {
+        if (lastPongRef.current < sentAt && wsRef.current === ws) ws.close();
+      }, 3000);
+    };
+    document.addEventListener('visibilitychange', onWake);
+    window.addEventListener('online', onWake);
+
+    return () => {
+      document.removeEventListener('visibilitychange', onWake);
+      window.removeEventListener('online', onWake);
+      stopped = true;
+      clearTimeout(reconnectTimerRef.current);
+      const ws = wsRef.current;
+      wsRef.current = null;
+      if (ws) ws.close();
+    };
+  }, [userProfile?.email, userProfile?.deviceType, syncWatchList]);
+
+  // Re-send the watch list only when the set of friend emails changes
+  const friendEmailsKey = friends.map((f) => f.email.toLowerCase()).join(',');
   useEffect(() => {
     syncWatchList();
-  }, [friends, syncWatchList]);
+  }, [friendEmailsKey, syncWatchList]);
 
+  // Heartbeat
   useEffect(() => {
     const hb = setInterval(() => {
       if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
@@ -287,25 +373,30 @@ export default function App() {
 
   const handleSendSignal = (targetEmail: string) => {
     if (!userProfile) return;
-    sonarAudio.triggerSonarSignal();
+    try {
+      sonarAudio.triggerSonarSignal();
+    } catch {}
     setSonarWaveActive(true);
     setTimeout(() => setSonarWaveActive(false), 2500);
 
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'SEND_SIGNAL',
-          payload: {
-            targetEmail,
-            fromEmail: userProfile.email,
-            fromNickname: userProfile.nickname,
-            fromDevice: userProfile.deviceType,
-            message: 'Signal from STRO! Hop on!',
-          },
-        })
-      );
+    const message = JSON.stringify({
+      type: 'SEND_SIGNAL',
+      payload: {
+        targetEmail,
+        fromEmail: userProfile.email,
+        fromNickname: userProfile.nickname,
+        fromDevice: userProfile.deviceType,
+        message: 'Signal from STRO! Hop on!',
+      },
+    });
+
+    const ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(message);
     } else {
-      showToast(`Signal queued...`);
+      pendingSignalsRef.current.push({ msg: message, at: Date.now() });
+      showToast('Reconnecting... signal will send automatically');
+      reconnectNowRef.current();
     }
   };
 
@@ -323,6 +414,10 @@ export default function App() {
         })
       );
     }
+  };
+
+  const handleCallFromSignal = (kind: CallKind, sig: SonarSignalMessage) => {
+    call.startCall(sig.fromEmail, sig.fromNickname || sig.fromEmail.split('@')[0], kind);
   };
 
   const handleAddFriend = (email: string, nickname?: string) => {
@@ -376,8 +471,6 @@ export default function App() {
     setIsSettingsOpen(false);
   };
 
-  const isOwner = userProfile?.email.toLowerCase() === AUTHORIZED_ADMIN_EMAIL.toLowerCase();
-
   return (
     <div
       className="min-h-screen flex flex-col relative overflow-x-hidden selection:bg-red-800 selection:text-white"
@@ -402,11 +495,7 @@ export default function App() {
         </div>
       )}
 
-      {/* TOP HEADER:
-          - UP LEFT: "stro", logo, and device using
-          - MIDDLE: user email
-          - FAR UP RIGHT: volume and settings tab
-      */}
+      {/* TOP HEADER */}
       <header
         className="sticky top-0 z-30 border-b backdrop-blur-md px-3 sm:px-6 py-2.5 flex items-center justify-between"
         style={{
@@ -473,7 +562,6 @@ export default function App() {
 
         {/* FAR UP RIGHT: Volume and Settings Tab */}
         <div className="flex items-center space-x-2">
-          {/* Volume toggle */}
           <button
             onClick={handleToggleSound}
             className="p-2 rounded-lg border transition-all"
@@ -487,7 +575,6 @@ export default function App() {
             {userProfile?.soundEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
           </button>
 
-          {/* Settings tab (with theme switcher and app settings) */}
           <button
             onClick={() => setIsSettingsOpen(true)}
             className="p-2 rounded-lg border transition-all hover:text-white"
@@ -566,52 +653,27 @@ export default function App() {
           )
         )}
 
-        {/* BOTTOM PART: Slogan "trust you dick to be pure"
-            (Testing controls only shown for admin/owner email)
-        */}
+        {/* BOTTOM PART: Slogan */}
         <div className="mt-8 text-center space-y-2 select-none">
           <p className="font-tactical font-bold text-xs tracking-widest text-white/50 uppercase">
             "trust you dick to be pure"
           </p>
-
-          {/* Testing strip only for the admin/owner */}
-          {isOwner && (
-            <div className="pt-2 flex items-center justify-center gap-3 text-[11px] font-mono text-white/30">
-              <span>[Developer Diagnostics]</span>
-              <button
-                onClick={() => {
-                  const testSig: SonarSignalMessage = {
-                    id: 'test_' + Date.now(),
-                    fromEmail: 'squad.test@gmail.com',
-                    fromNickname: 'Test Squad',
-                    fromDevice: 'phone',
-                    toEmail: userProfile.email,
-                    timestamp: Date.now(),
-                    message: 'Diagnostic red sonar test!',
-                  };
-                  setActiveSignal(testSig);
-                }}
-                className="underline hover:text-white"
-              >
-                Trigger Flash
-              </button>
-            </div>
-          )}
         </div>
       </main>
 
-      {/* FULL-SCREEN SONAR FLASH: GLOWS USER'S THEME COLOR + SMALL BOX WITH GREEN/RED */}
+      {/* FULL-SCREEN SONAR FLASH + RESPONSE BOX */}
       {activeSignal && (
         <BrightRedSonarFlash
           signal={activeSignal}
           theme={currentTheme}
           durationSeconds={10}
           onRespond={handleRespondToSignal}
+          onCall={handleCallFromSignal}
           onDismiss={() => setActiveSignal(null)}
         />
       )}
 
-      {/* SETTINGS MODAL (with color theme picker & audio) */}
+      {/* SETTINGS MODAL */}
       {userProfile && (
         <SettingsModal
           isOpen={isSettingsOpen}
@@ -624,14 +686,13 @@ export default function App() {
         />
       )}
 
-      {/* LOGIN MODAL (when first opening app, asks for email) */}
+      {/* LOGIN MODAL */}
       {!userProfile && (
-        <LoginModal
-          onLogin={handleLogin}
-          theme={currentTheme}
-          defaultEmail="grifixlanx@gmail.com"
-        />
+        <LoginModal onLogin={handleLogin} theme={currentTheme} defaultEmail="" />
       )}
+
+      {/* VOICE / VIDEO CALL SCREEN */}
+      <CallScreen call={call} theme={currentTheme} />
     </div>
   );
 }
